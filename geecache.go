@@ -1,29 +1,33 @@
-package geeCache
+package geecache
 
 import (
 	"fmt"
+	pb "geecache/geecachepb"
+	"geecache/singleflight"
 	"log"
 	"sync"
 )
 
-// A Getter loads data for a key.
+// Getter 加载键值的回调
 type Getter interface {
 	Get(key string) ([]byte, error)
 }
 
-// A GetterFunc implements Getter with a function.
+// GetterFunc 函数类型实现Getter接口
 type GetterFunc func(key string) ([]byte, error)
 
-// Get implements Getter interface function
+// Get 实现Getter接口
 func (f GetterFunc) Get(key string) ([]byte, error) {
 	return f(key)
 }
 
-// A Group is a cache namespace and associated data loaded spread over
+// Group 是一个缓存的命名空间
 type Group struct {
 	name      string
 	getter    Getter
 	mainCache cache
+	peers     PeerPicker
+	loader    *singleflight.Group
 }
 
 var (
@@ -31,8 +35,8 @@ var (
 	groups = make(map[string]*Group)
 )
 
-// NewGroup create a new instance of Group
-func NewGroup(name string, cacheMaxBytes int64, getter Getter) *Group {
+// NewGroup 创建一个新的Group实例
+func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
 	if getter == nil {
 		panic("nil Getter")
 	}
@@ -41,14 +45,14 @@ func NewGroup(name string, cacheMaxBytes int64, getter Getter) *Group {
 	g := &Group{
 		name:      name,
 		getter:    getter,
-		mainCache: cache{cacheMaxBytes: cacheMaxBytes},
+		mainCache: cache{cacheBytes: cacheBytes},
+		loader:    &singleflight.Group{},
 	}
 	groups[name] = g
 	return g
 }
 
-// GetGroup returns the named group previously created with NewGroup, or
-// nil if there's no such group.
+// GetGroup 返回之前创建的Group
 func GetGroup(name string) *Group {
 	mu.RLock()
 	g := groups[name]
@@ -56,24 +60,49 @@ func GetGroup(name string) *Group {
 	return g
 }
 
-// Get value for a key from cache
+// RegisterPeers registers a PeerPicker for choosing remote peer
+func (g *Group) RegisterPeers(peers PeerPicker) {
+	if g.peers != nil {
+		panic("RegisterPeerPicker called more than once")
+	}
+	g.peers = peers
+}
+
+// Get 从缓存中获取键对应的值
 func (g *Group) Get(key string) (ByteView, error) {
 	if key == "" {
 		return ByteView{}, fmt.Errorf("key is required")
 	}
 
 	if v, ok := g.mainCache.get(key); ok {
-		log.Println("[GeeCache] hit")
 		return v, nil
 	}
 
 	return g.load(key)
 }
 
+// load 加载键值
 func (g *Group) load(key string) (value ByteView, err error) {
-	return g.getLocally(key)
+	viewi, err := g.loader.Do(key, func() (interface{}, error) {
+		if g.peers != nil {
+			if peer, ok := g.peers.PickPeer(key); ok {
+				if value, err = g.getFromPeer(peer, key); err == nil {
+					return value, nil
+				}
+				log.Println("[GeeCache] Failed to get from peer", err)
+			}
+		}
+
+		return g.getLocally(key)
+	})
+
+	if err == nil {
+		return viewi.(ByteView), nil
+	}
+	return
 }
 
+// getLocally 调用用户回调函数获取值
 func (g *Group) getLocally(key string) (ByteView, error) {
 	bytes, err := g.getter.Get(key)
 	if err != nil {
@@ -84,6 +113,20 @@ func (g *Group) getLocally(key string) (ByteView, error) {
 	return value, nil
 }
 
+// populateCache 将键值对添加到缓存
 func (g *Group) populateCache(key string, value ByteView) {
 	g.mainCache.add(key, value)
+}
+
+func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
+	req := &pb.Request{
+		Group: g.name,
+		Key:   key,
+	}
+	res := &pb.Response{}
+	err := peer.Get(req, res)
+	if err != nil {
+		return ByteView{}, err
+	}
+	return ByteView{b: res.Value}, nil
 }
